@@ -1,3 +1,141 @@
+//! # The Devils
+//!
+//! Work in progress thread-based [structured
+//! concurrency](https://en.wikipedia.org/wiki/Structured_concurrency) library
+//! inspired by Dostoevsky.
+//!
+//! ## Problem Space
+//!
+//! In my experience, getting concurrent software right is devilishly hard. The
+//! frustration stems from the fact that it's relatively easy to come up with a
+//! solution that works in a steady state, but it's hard to ensure that the
+//! solution handles all the edge cases correctly. Some typical problems I
+//! observed in real-world applications:
+//!
+//! * Broken shutdown. Many applications include dedicated code to handle
+//!   shutdown in every place where concurrency happens. This code is rarely
+//!   tested and often broken.
+//! * Abruptly killed threads. Rust program exits when the main thread exits.
+//!   All other currently running threads are terminated forcefully, without
+//!   running destructors. This might lead to application's logical invariants
+//!   being broken (ie, buffered readers not flushed to disk).
+//! * Concurrency leaks. When running tests, it often happens that one tests
+//!   schedules a piece of concurrent work which outlives the test itself and
+//!   interferers with other tests.
+//! * Loss of causality. Sometimes, and especially in tests, software has loops,
+//!   which wait for a condition to become true with some sleep in between.
+//!
+//! This library tries to encode a particular pattern which eliminates these
+//! problems by construction. As such, be warned -- this library doesn't _do_
+//! anything useful (besides a particular implementation of spsc channels, which
+//! is a private implementation detail), and is just a helper for structuring
+//! code.
+//!
+//! ## Handles
+//!
+//! Handles are the core concept of this library. A [`Handle`] owns a unit of
+//! concurrent work: a dedicated thread or a task running on a thread pool
+//! (called a "devil", or, in Russian, "бес"). The main invariant is that this
+//! concurrent work continues only as long as the corresponding `Handle` is
+//! alive. In other words, handles *block* in [`Drop`], waiting for the
+//! corresponding work to complete.
+//!
+//! ## Cancellation, Input & Output
+//!
+//! It's possible to signal a running devil. The simplest signal is cancellation
+//! -- a note that the work is no longer interesting and should be wrapped up.
+//!
+//! A closure which is used to spawn a devil gets a [`Receiver<T>`] channel. The
+//! [`Receiver::recv`] blocks and returns the next message or, if cancellation
+//! was requested,  [`None`].
+//!
+//! The corresponding `Handle` has a [`Handle::send`] method for sending
+//! messages to the devil. If you only interested in cancellation, use [`Void`]
+//! as a message type. [`Handle::stop`] method requests cancellation. It is
+//! automatically called on `Drop`. The `stop` method doesn't block -- drop or
+//! join the `Handle` to wait for stopped devil to finish.
+//!
+//! A devil can produce a single value ([`Handle`]) or a sequence of values
+//! ([`StreamHandle`]). You can receive the output using [`Handle::join`] or
+//! [`StreamHandle::recv`] methods.
+//!
+//! ## Spawning
+//!
+//! The library defines concurrent work, but is decoupled from its execution.
+//! That is, you can run the devils on a thread pool, but you'll need to bring
+//! your own thread pool. [`spawn`] and [`spawn_stream`] return a pair of a
+//! handle and a [`Devil`]. The `Devil` has only a single method,
+//! [`Devil::run`], which you use to start the work. A typical usage looks like
+//! this:
+//!
+//! ```
+//! use devils::Void;
+//! # struct Pool; impl Pool { fn submit(&self, _: devils::Devil) {} } let pool = Pool;
+//! let (handle, devil) = devils::spawn(|_: &mut devils::Receiver<Void>| 92);
+//! pool.submit(devil);
+//! let res = handle.join();
+//! ```
+//!
+//! As a convenience, [`spawn_new_thread`] and [`spawn_stream_new_thread`]
+//! shortcut functions exist to spawn a devil onto a dedicated thread.
+//!
+//! ## Tree Of Ownership
+//!
+//! At runtime, devils form a tree, with a parent devil owning the handles for
+//! children. This tree has ownership semantics -- children do not outlive the
+//! parents. Communication is also restricted to the ownership tree -- a devil
+//! can `send` a message or `stop` one of the handles it owns, and only the
+//! devil's parent can `recv` the messages it outputs.
+//!
+//! Panics are also propagated along the tree. If a child panics, the parent
+//! will panic as well the next time it tries to interact with it, propagating
+//! the panic's payload. If several children panic concurrently, only the first
+//! payload will be propagated. The `Drop` impl always waits for the children,
+//! but it is careful to not cause a double panic.
+//!
+//! ## Select
+//!
+//! The [`Selector`] struct provides the API for waiting for one of the several
+//! events. It's API is similar to that of `poll`. [`Selector::add`] method adds
+//! an event to watch, together with associated user-provided key.
+//! [(`Selector::wait`)] method returns the key for the event which is ready.
+//! One of the `_now` functions is then used to complete the operation. Example:
+//!
+//! ```
+//! use devils::Void;
+//!
+//! devils::spawn_new_thread(|receiver: &mut devils::Receiver<i32>| {
+//!     # let spawn_workers = || vec![];
+//!     let mut workers: Vec<devils::Handle<Void, i32>> = spawn_workers();
+//!
+//!     enum Key { Receiver, Worker(usize) }
+//!
+//!     let key = {
+//!         let mut sel = devils::Selector::new();
+//!         sel.add(Key::Receiver, receiver.event());
+//!         for (idx, w) in workers.iter_mut().enumerate() {
+//!             sel.add(Key::Worker(idx), w.event());
+//!         }
+//!         sel.wait()
+//!     };
+//!
+//!     match key {
+//!         Key::Receiver => {
+//!             match receiver.recv_now() {
+//!                 Some(number) => println!("received {}", number),
+//!                 None => println!("stopped"),
+//!             }
+//!         }
+//!         Key::Worker(idx) => {
+//!             let w = workers.swap_remove(idx);
+//!             match w.join_now() {
+//!                 Some(number) => println!("worker compted {}", number),
+//!                 None => println!("worker stopped"),
+//!             }
+//!         }
+//!     }
+//! });
+
 use std::{
     collections::VecDeque,
     mem, panic,
@@ -295,7 +433,8 @@ impl<'a, K> Selector<'a, K> {
     }
 }
 
-// Implementation.
+// region:implementation
+
 fn propagate<T>(res: thread::Result<T>) -> T {
     res.unwrap_or_else(|a| panic::resume_unwind(a))
 }
@@ -471,3 +610,4 @@ fn defer<F: FnOnce()>(f: F) -> impl Drop {
     }
     D(Some(f))
 }
+// endregion:implementation
