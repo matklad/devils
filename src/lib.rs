@@ -1,6 +1,6 @@
 use std::{
     collections::VecDeque,
-    mem, panic,
+    fmt, mem, panic,
     sync::{Arc, Mutex, MutexGuard},
     thread,
 };
@@ -58,7 +58,15 @@ impl<'a, K> Selector<'a, K> {
 pub enum Act<Y, C> {
     Yield(Y),
     Complete(C),
-    Cancel,
+}
+
+impl<C> Act<Void, C> {
+    pub fn completed(self) -> C {
+        match self {
+            Act::Yield(void) => match void {},
+            Act::Complete(it) => it,
+        }
+    }
 }
 
 pub struct Activity<I, Y, C> {
@@ -66,9 +74,21 @@ pub struct Activity<I, Y, C> {
     receiver: Arc<Chan<Y, thread::Result<C>>>,
 }
 
+impl<I, Y, C> fmt::Debug for Activity<I, Y, C> {
+    fn fmt(&self, _f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        todo!()
+    }
+}
+
 pub struct Mailbox<I, Y, C> {
     sender: Arc<Chan<Y, thread::Result<C>>>,
     receiver: Arc<Chan<I, Void>>,
+}
+
+impl<I, Y, C> fmt::Debug for Mailbox<I, Y, C> {
+    fn fmt(&self, _f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        todo!()
+    }
 }
 
 impl<I, Y, C> Drop for Activity<I, Y, C> {
@@ -88,9 +108,27 @@ impl<I, Y, C> Drop for Activity<I, Y, C> {
     }
 }
 
-impl<I: Send + 'static, Y: Send + 'static, C: Send + 'static> Activity<I, Y, C> {
+impl<I, Y, C> Activity<I, Y, C>
+where
+    I: Send + 'static,
+    Y: Send + 'static,
+    C: Send + 'static,
+{
     pub fn new(
-        f: impl FnOnce(&mut Mailbox<I, Y, C>) -> Option<C> + Send + 'static,
+        f: impl FnOnce(&mut Mailbox<I, Y, Option<C>>) -> C + Send + 'static,
+    ) -> (impl FnOnce() + Send + 'static, Activity<I, Y, Option<C>>) {
+        Activity::new_(|mailbox| Some(f(mailbox)), Option::default)
+    }
+
+    pub fn spawn(f: impl FnOnce(&mut Mailbox<I, Y, C>) -> C + Send + 'static) -> Self {
+        let (f, h) = Self::new_(f, || unreachable!());
+        std::thread::spawn(f);
+        h
+    }
+
+    fn new_(
+        f: impl FnOnce(&mut Mailbox<I, Y, C>) -> C + Send + 'static,
+        cancelled: impl FnOnce() -> C + Send + 'static,
     ) -> (impl FnOnce() + Send + 'static, Self) {
         let ichan = Chan::<I, Void>::new();
         let ichan = Arc::new(ichan);
@@ -101,24 +139,29 @@ impl<I: Send + 'static, Y: Send + 'static, C: Send + 'static> Activity<I, Y, C> 
         let f = {
             let mut mailbox = Mailbox { sender: Arc::clone(&ychan), receiver: Arc::clone(&ichan) };
             let ychan = Arc::clone(&ychan);
-            let defer = defer({
+
+            struct D<F: FnOnce()>(Option<F>);
+            impl<F: FnOnce()> Drop for D<F> {
+                fn drop(&mut self) {
+                    if let Some(f) = self.0.take() {
+                        f()
+                    }
+                }
+            }
+            let mut defer = D(Some({
                 let ychan = Arc::clone(&ychan);
-                move || ychan.close_with(None)
-            });
+                move || ychan.close_with(Some(Ok(cancelled())))
+            }));
+
             move || {
-                let _d = defer;
                 let f = panic::AssertUnwindSafe(f);
                 let r = panic::catch_unwind(move || f.0(&mut mailbox));
-                ychan.close_with(r.transpose())
+                ychan.close_with(Some(r));
+                defer.0.take();
             }
         };
 
         (f, Activity { sender: Some(ichan), receiver: ychan })
-    }
-    pub fn spawn(f: impl FnOnce(&mut Mailbox<I, Y, C>) -> Option<C> + Send + 'static) -> Self {
-        let (f, h) = Self::new(f);
-        std::thread::spawn(f);
-        h
     }
 }
 
@@ -139,15 +182,15 @@ impl<I, Y, C> Activity<I, Y, C> {
     pub fn recv(&mut self) -> Act<Y, C> {
         match self.receiver.recv() {
             Ok(it) => Act::Yield(it),
-            Err(None) => Act::Cancel,
             Err(Some(res)) => Act::Complete(propagate(res)),
+            Err(None) => unreachable!(),
         }
     }
     pub fn recv_now(&mut self) -> Result<Act<Y, C>, WouldBlock> {
         let res = match self.receiver.recv_now().map_err(|()| WouldBlock)? {
             Ok(it) => Act::Yield(it),
-            Err(None) => Act::Cancel,
             Err(Some(res)) => Act::Complete(propagate(res)),
+            Err(None) => unreachable!(),
         };
         Ok(res)
     }
@@ -158,7 +201,12 @@ impl<I, Y, C> Activity<I, Y, C> {
     }
 }
 
-impl<I: Send + 'static, Y: Send + 'static, C: Send + 'static> Mailbox<I, Y, C> {
+impl<I, Y, C> Mailbox<I, Y, C>
+where
+    I: Send + 'static,
+    Y: Send + 'static,
+    C: Send + 'static,
+{
     pub fn send(&mut self, value: Y) {
         self.sender.send(value).unwrap_or_else(|_| unreachable!())
     }
@@ -333,15 +381,4 @@ impl<T> AnyChan for Chan<T, Void> {
     }
 }
 
-fn defer<F: FnOnce()>(f: F) -> impl Drop {
-    struct D<F: FnOnce()>(Option<F>);
-    impl<F: FnOnce()> Drop for D<F> {
-        fn drop(&mut self) {
-            if let Some(f) = self.0.take() {
-                f()
-            }
-        }
-    }
-    D(Some(f))
-}
 // endregion:implementation

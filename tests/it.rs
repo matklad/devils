@@ -14,7 +14,7 @@ type AStream<Y> = Activity<Void, Y, ()>;
 
 #[test]
 fn run_to_completion() {
-    let mut a = ATask::<i32>::spawn(|_inbox| Some(92));
+    let mut a = ATask::<i32>::spawn(|_inbox| 92);
     let res = a.recv();
     assert_eq!(res, Act::Complete(92));
 }
@@ -22,25 +22,22 @@ fn run_to_completion() {
 #[test]
 fn block_in_drop() {
     static FLAG: AtomicBool = AtomicBool::new(false);
-    let a = ATask::<()>::spawn(|_| {
-        FLAG.store(true, Relaxed);
-        Some(())
-    });
+    let a = ATask::<()>::spawn(|_| FLAG.store(true, Relaxed));
     drop(a);
     assert!(FLAG.load(Relaxed));
 }
 
 #[test]
 fn drop_before_start() {
-    let (r, mut a) = ATask::<i32>::new(|_inbox| Some(92));
+    let (r, mut a) = ATask::<i32>::new(|_inbox| 92);
     drop(r);
     let res = a.recv();
-    assert_eq!(res, Act::Cancel);
+    assert_eq!(res, Act::Complete(None));
 }
 
 #[test]
 fn drop_before_start2() {
-    let (d, h) = ATask::<i32>::new(|_inbox| Some(92));
+    let (d, h) = ATask::<i32>::new(|_inbox| 92);
     drop(d);
     drop(h);
 }
@@ -49,7 +46,7 @@ fn drop_before_start2() {
 fn drop_before_start3() {
     #![allow(unused)]
 
-    ATask::<i32>::new(|_inbox| Some(92));
+    ATask::<i32>::new(|_inbox| 92);
 }
 
 #[test]
@@ -64,7 +61,6 @@ fn stream_run_to_completion() {
         for it in 1..=3 {
             mailbox.send(it)
         }
-        Some(())
     });
     assert_eq!(h.recv(), Act::Yield(1));
     assert_eq!(h.recv(), Act::Yield(2));
@@ -74,15 +70,15 @@ fn stream_run_to_completion() {
 
 #[test]
 fn stream_drop_before_start() {
-    let (d, mut h) = AStream::<Void>::new(|_| Some(()));
+    let (d, mut h) = AStream::<Void>::new(|_| ());
     drop(d);
     let res = h.recv();
-    assert_eq!(res, Act::Cancel);
+    assert_eq!(res, Act::Complete(None));
 }
 
 #[test]
 fn stream_drop_before_start2() {
-    let (d, h) = AStream::<Void>::new(|_| Some(()));
+    let (d, h) = AStream::<Void>::new(|_| ());
     drop(d);
     drop(h);
 }
@@ -100,7 +96,7 @@ fn sum() {
         while let Some(msg) = mailbox.recv() {
             total += msg
         }
-        Some(total)
+        total
     });
     for i in 1..=3 {
         h.send(i)
@@ -116,7 +112,6 @@ fn two_devils() {
         while let Some(msg) = mailbox.recv() {
             mailbox.send(msg * 2)
         }
-        Some(())
     });
 
     for i in 1..=3 {
@@ -139,7 +134,6 @@ fn worker_devils() {
     for i in perm {
         handles.push(ATask::<()>::spawn(move |_| {
             while CNT.compare_exchange(i, i + 1, Relaxed, Relaxed).is_err() {}
-            Some(())
         }))
     }
     CNT.store(1, Relaxed);
@@ -172,7 +166,6 @@ impl ThreadPool {
                             work();
                             mailbox.send(())
                         }
-                        Some(())
                     })
                 })
                 .collect();
@@ -199,7 +192,7 @@ impl ThreadPool {
                 } else {
                     match workers[key].recv_now().unwrap() {
                         Act::Yield(()) => idle.push(key),
-                        _ => panic!("worker thread died"),
+                        Act::Complete(()) => panic!("worker thread died"),
                     }
                 }
 
@@ -213,7 +206,6 @@ impl ThreadPool {
                     break;
                 }
             }
-            Some(())
         });
 
         ThreadPool { leader }
@@ -221,12 +213,12 @@ impl ThreadPool {
     pub fn submit(&mut self, f: impl FnOnce() + Send + 'static) {
         self.leader.send(Box::new(f))
     }
-    pub fn submit_activity<F, I, Y, C>(&mut self, f: F) -> Activity<I, Y, C>
+    pub fn submit_activity<F, I, Y, C>(&mut self, f: F) -> Activity<I, Y, Option<C>>
     where
         I: Send + 'static,
         Y: Send + 'static,
         C: Send + 'static,
-        F: FnOnce(&mut Mailbox<I, Y, C>) -> Option<C> + Send + 'static,
+        F: FnOnce(&mut Mailbox<I, Y, Option<C>>) -> C + Send + 'static,
     {
         let (f, h) = Activity::new(f);
         self.submit(f);
@@ -258,19 +250,21 @@ fn test_pool() {
     for i in 0..100 {
         let start = rng.u32(..100);
         if rng.bool() {
-            let h = pool.submit_activity(move |mailbox: &mut Mailbox<Void, (usize, u32), ()>| {
-                for c in collatz(start) {
-                    step(i);
-                    mailbox.send((i, c));
-                }
-                Some(())
-            });
+            let h = pool.submit_activity(
+                move |mailbox: &mut Mailbox<Void, (usize, u32), Option<()>>| {
+                    for c in collatz(start) {
+                        step(i);
+                        mailbox.send((i, c));
+                    }
+                },
+            );
             procs.push(h)
         } else {
-            let h = pool.submit_activity(move |_: &mut Mailbox<Void, Void, (u32, usize)>| {
-                let len = collatz(start).inspect(|_| step(i)).count();
-                Some((start, len))
-            });
+            let h =
+                pool.submit_activity(move |_: &mut Mailbox<Void, Void, Option<(u32, usize)>>| {
+                    let len = collatz(start).inspect(|_| step(i)).count();
+                    (start, len)
+                });
             jobs.push(h)
         }
     }
@@ -292,17 +286,16 @@ fn test_pool() {
         };
 
         match key {
-            Key::Job(i) => match jobs.swap_remove(i).recv_now().unwrap() {
-                Act::Yield(void) => match void {},
-                Act::Complete((_start, _len)) => (),
-                Act::Cancel => panic!(),
+            Key::Job(i) => match jobs.swap_remove(i).recv_now().unwrap().completed() {
+                Some((_start, _len)) => (),
+                None => panic!(),
             },
             Key::Proc(i) => match procs[i].recv_now().unwrap() {
                 Act::Yield((_i, _c)) => {}
-                Act::Complete(()) => {
+                Act::Complete(Some(())) => {
                     procs.swap_remove(i);
                 }
-                Act::Cancel => panic!(),
+                Act::Complete(None) => panic!(),
             },
         }
     }
@@ -348,7 +341,7 @@ fn mini_rust_analyzer() {
         sleep_ms(100);
     }
 
-    fn main_loop(inbox: &mut Mailbox<LspRequest, Void, ()>) -> Option<()> {
+    fn main_loop(inbox: &mut Mailbox<LspRequest, Void, ()>) {
         let mut pool = ThreadPool::new(4);
 
         let mut vfs = Activity::<VfsConfig, VfsChange, ()>::spawn(move |mailbox| {
@@ -357,10 +350,9 @@ fn mini_rust_analyzer() {
                 mailbox.send(VfsChange);
                 mailbox.send(VfsChange);
             }
-            Some(())
         });
 
-        let mut tasks: Vec<ATask<Response>> = Vec::new();
+        let mut tasks: Vec<Activity<Void, Void, Option<Response>>> = Vec::new();
         let mut active_checker: Option<AStream<CheckMessage>> = None;
         let mut stopped_checkers: Vec<AStream<CheckMessage>> = Vec::new();
 
@@ -398,27 +390,27 @@ fn mini_rust_analyzer() {
             match key {
                 Key::Inbox => match inbox.recv_now().unwrap() {
                     Some(request) => {
-                        let task =
-                            pool.submit_activity(move |_: &mut Mailbox<Void, Void, Response>| {
-                                Some(Response { data: request.data * 2 })
-                            });
+                        let task = pool.submit_activity(
+                            move |_: &mut Mailbox<Void, Void, Option<Response>>| Response {
+                                data: request.data * 2,
+                            },
+                        );
                         tasks.push(task);
                     }
                     None => break,
                 },
                 Key::Task(idx) => {
                     let mut task = tasks.swap_remove(idx);
-                    let resp = match task.recv_now().unwrap() {
-                        Act::Yield(void) => match void {},
-                        Act::Complete(it) => it,
-                        Act::Cancel => unreachable!(),
+                    let resp = match task.recv_now().unwrap().completed() {
+                        Some(it) => it,
+                        None => unreachable!(),
                     };
                     eprintln!("responding: {}", resp.data);
                 }
                 Key::Vfs => {
                     let VfsChange = match vfs.recv_now().unwrap() {
                         Act::Yield(it) => it,
-                        _ => panic!("vfs never cancelled"),
+                        Act::Complete(()) => panic!("vfs never cancelled"),
                     };
                     eprintln!("received vfs change");
                     restart_checker = true;
@@ -429,12 +421,12 @@ fn mini_rust_analyzer() {
                         Act::Yield(CheckMessage { message }) => {
                             eprintln!("received check msg: {:?}", message)
                         }
-                        _ => active_checker = None,
+                        Act::Complete(()) => active_checker = None,
                     }
                 }
                 Key::StoppedChecker(idx) => match stopped_checkers[idx].recv_now().unwrap() {
                     Act::Yield(CheckMessage { .. }) => (),
-                    _ => {
+                    Act::Complete(()) => {
                         stopped_checkers.swap_remove(idx);
                     }
                 },
@@ -447,10 +439,9 @@ fn mini_rust_analyzer() {
                 active_checker = Some(Activity::spawn(checker))
             }
         }
-        Some(())
     }
 
-    fn checker(mailbox: &mut Mailbox<Void, CheckMessage, ()>) -> Option<()> {
+    fn checker(mailbox: &mut Mailbox<Void, CheckMessage, ()>) {
         #[derive(Default)]
         struct Process {
             killed: AtomicBool,
@@ -481,7 +472,6 @@ fn mini_rust_analyzer() {
                 while let Some(msg) = process.read() {
                     mailbox.send(msg);
                 }
-                Some(())
             }
         });
 
@@ -500,11 +490,10 @@ fn mini_rust_analyzer() {
             } else {
                 match child.recv_now().unwrap() {
                     Act::Yield(message) => mailbox.send(CheckMessage { message }),
-                    _ => break,
+                    Act::Complete(()) => break,
                 }
             }
         }
-        Some(())
     }
 }
 
