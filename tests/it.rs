@@ -7,34 +7,41 @@ use std::{
     },
 };
 
-use devils::{Selector, Void};
+use devils::{Handle, Selector, Void};
 
 #[test]
 fn run_to_completion() {
-    let h = devils::spawn_new_thread::<Void, _, _>(|_inbox| 92);
+    let h = Handle::<Void, i32>::start_thread(|_inbox| 92);
     let res = h.join();
     assert_eq!(res, Some(92));
 }
 
 #[test]
 fn drop_before_start() {
-    let (h, d) = devils::spawn::<Void, _, _>(|_inbox| 92);
-    drop(d);
+    let (r, h) = Handle::<Void, i32>::spawn(|_inbox| 92);
+    drop(r);
     let res = h.join();
     assert_eq!(res, None);
 }
 
 #[test]
 fn drop_before_start2() {
-    let (h, d) = devils::spawn::<Void, _, _>(|_inbox| 92);
+    let (d, h) = Handle::<Void, i32>::spawn(|_inbox| 92);
     drop(d);
     drop(h);
 }
 
 #[test]
+fn drop_before_start3() {
+    #![allow(unused)]
+
+    Handle::<Void, i32>::spawn(|_inbox| 92);
+}
+
+#[test]
 #[should_panic]
 fn propagates_panic() {
-    devils::spawn_new_thread::<Void, Void, _>(|_| unwind());
+    Handle::<Void, Void>::start_thread(|_| unwind());
 }
 
 #[test]
@@ -207,8 +214,8 @@ impl ThreadPool {
         I: Send + 'static,
         F: FnOnce(&mut devils::Receiver<I>) -> T + Send + 'static,
     {
-        let (h, d) = devils::spawn(f);
-        self.submit(move || d.run());
+        let (r, h) = Handle::<I, T>::spawn(f);
+        self.submit(r);
         h
     }
     pub fn submit_devil_stream<F, I, T>(&mut self, f: F) -> devils::StreamHandle<I, T>

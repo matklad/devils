@@ -69,9 +69,9 @@
 //! this:
 //!
 //! ```
-//! use devils::Void;
-//! # struct Pool; impl Pool { fn submit(&self, _: devils::Devil) {} } let pool = Pool;
-//! let (handle, devil) = devils::spawn(|_: &mut devils::Receiver<Void>| 92);
+//! use devils::{Void, Handle};
+//! # struct Pool; impl Pool { fn submit<T>(&self, _: T) {} } let pool = Pool;
+//! let (devil, handle) = Handle::spawn(|_: &mut devils::Receiver<Void>| 92);
 //! pool.submit(devil);
 //! let res = handle.join();
 //! ```
@@ -156,6 +156,45 @@ pub struct StreamHandle<I, T> {
 }
 
 impl<I, T> Handle<I, T> {
+    pub fn spawn<F>(f: F) -> (impl FnOnce() + Send + 'static, Handle<I, T>)
+    where
+        I: Send + 'static,
+        T: Send + 'static,
+        F: FnOnce(&mut Receiver<I>) -> T + Send + 'static,
+    {
+        let mailbox = Chan::<I, Void>::new();
+        let mailbox = Arc::new(mailbox);
+
+        let res = Chan::<Void, thread::Result<T>>::new();
+        let res = Arc::new(res);
+
+        let f = {
+            let mut receiver = Receiver { chan: Arc::clone(&mailbox) };
+            let res = Arc::clone(&res);
+            let defer = defer({
+                let res = Arc::clone(&res);
+                move || res.close_with(None)
+            });
+            move || {
+                let _d = defer;
+                let f = panic::AssertUnwindSafe(f);
+                let r = panic::catch_unwind(move || f.0(&mut receiver));
+                res.close_with(Some(r))
+            }
+        };
+        (f, Handle { sender: Some(mailbox), receiver: res })
+    }
+    pub fn start_thread<F>(f: F) -> Handle<I, T>
+    where
+        I: Send + 'static,
+        T: Send + 'static,
+        F: FnOnce(&mut Receiver<I>) -> T + Send + 'static,
+    {
+        let (r, h) = Self::spawn(f);
+        std::thread::spawn(r);
+        h
+    }
+
     pub fn send(&mut self, value: I) {
         match &mut self.sender {
             Some(it) => match it.send(value) {
@@ -307,43 +346,14 @@ impl Devil {
     }
 }
 
-pub fn spawn<I, T, F>(f: F) -> (Handle<I, T>, Devil)
-where
-    I: Send + 'static,
-    T: Send + 'static,
-    F: FnOnce(&mut Receiver<I>) -> T + Send + 'static,
-{
-    let mailbox = Chan::<I, Void>::new();
-    let mailbox = Arc::new(mailbox);
-
-    let res = Chan::<Void, thread::Result<T>>::new();
-    let res = Arc::new(res);
-
-    let f = Box::new({
-        let mut receiver = Receiver { chan: Arc::clone(&mailbox) };
-        let res = Arc::clone(&res);
-        let defer = defer({
-            let res = Arc::clone(&res);
-            move || res.close_with(None)
-        });
-        move || {
-            let _d = defer;
-            let f = panic::AssertUnwindSafe(f);
-            let r = panic::catch_unwind(move || f.0(&mut receiver));
-            res.close_with(Some(r))
-        }
-    });
-    (Handle { sender: Some(mailbox), receiver: res }, Devil { f })
-}
-
 pub fn spawn_new_thread<I, T, F>(f: F) -> Handle<I, T>
 where
     I: Send + 'static,
     T: Send + 'static,
     F: FnOnce(&mut Receiver<I>) -> T + Send + 'static,
 {
-    let (handle, devil) = spawn(f);
-    let _ = thread::spawn(move || devil.run());
+    let (r, handle) = Handle::<I, T>::spawn(f);
+    let _ = thread::spawn(r);
     handle
 }
 
