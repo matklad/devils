@@ -7,7 +7,7 @@ use std::{
     },
 };
 
-use devils::{Selector, StreamHandle, Task, Void};
+use devils::{Selector, StreamTask, Task, Void};
 
 #[test]
 fn run_to_completion() {
@@ -46,8 +46,7 @@ fn propagates_panic() {
 
 #[test]
 fn stream_run_to_completion() {
-    let mut h =
-        StreamHandle::<Void, i32>::spawn(|_, outbox| (1..=3).for_each(|it| outbox.send(it)));
+    let mut h = StreamTask::<Void, i32>::spawn(|_, outbox| (1..=3).for_each(|it| outbox.send(it)));
     assert_eq!(h.recv(), Some(1));
     assert_eq!(h.recv(), Some(2));
     assert_eq!(h.recv(), Some(3));
@@ -56,7 +55,7 @@ fn stream_run_to_completion() {
 
 #[test]
 fn stream_drop_before_start() {
-    let (d, mut h) = StreamHandle::<Void, Void>::new(|_, _| ());
+    let (d, mut h) = StreamTask::<Void, Void>::new(|_, _| ());
     drop(d);
     let res = h.recv();
     assert_eq!(res, None);
@@ -64,7 +63,7 @@ fn stream_drop_before_start() {
 
 #[test]
 fn stream_drop_before_start2() {
-    let (d, h) = StreamHandle::<Void, Void>::new(|_, _| ());
+    let (d, h) = StreamTask::<Void, Void>::new(|_, _| ());
     drop(d);
     drop(h);
 }
@@ -72,7 +71,7 @@ fn stream_drop_before_start2() {
 #[test]
 #[should_panic]
 fn stream_propagates_panic() {
-    StreamHandle::spawn(|_: &mut devils::Receiver<Void>, _: &mut devils::Sender<Void>| unwind());
+    StreamTask::spawn(|_: &mut devils::Receiver<Void>, _: &mut devils::Sender<Void>| unwind());
 }
 
 #[test]
@@ -93,7 +92,7 @@ fn sum() {
 
 #[test]
 fn two_devils() {
-    let mut child = StreamHandle::spawn(move |child_inbox, outbox| {
+    let mut child = StreamTask::spawn(move |child_inbox, outbox| {
         for msg in child_inbox {
             outbox.send(msg * 2)
         }
@@ -129,7 +128,7 @@ fn worker_devils() {
         }
         let i = sel.wait();
         let h = handles.swap_remove(i);
-        assert!(h.join_now().is_some());
+        assert!(h.join_now().unwrap().is_some());
     }
 }
 
@@ -144,9 +143,9 @@ impl ThreadPool {
         let leader = Task::spawn(move |inbox| {
             let mut task_queue = VecDeque::new();
             let mut idle: Vec<usize> = (0..n_threads).collect();
-            let mut workers: Vec<devils::StreamHandle<Work, ()>> = (0..n_threads)
+            let mut workers: Vec<devils::StreamTask<Work, ()>> = (0..n_threads)
                 .map(|_worker| {
-                    StreamHandle::spawn(
+                    StreamTask::spawn(
                         move |inbox: &mut devils::Receiver<Work>,
                               outbox: &mut devils::Sender<()>| {
                             for work in inbox {
@@ -178,7 +177,7 @@ impl ThreadPool {
                         None => inbox_open = false,
                     }
                 } else {
-                    match workers[key].recv_now() {
+                    match workers[key].recv_now().unwrap() {
                         Some(()) => idle.push(key),
                         None => panic!("worker thread died"),
                     }
@@ -211,13 +210,13 @@ impl ThreadPool {
         self.submit(r);
         h
     }
-    pub fn submit_devil_stream<F, I, T>(&mut self, f: F) -> devils::StreamHandle<I, T>
+    pub fn submit_devil_stream<F, I, T>(&mut self, f: F) -> devils::StreamTask<I, T>
     where
         T: Send + 'static,
         I: Send + 'static,
         F: FnOnce(&mut devils::Receiver<I>, &mut devils::Sender<T>) + Send + 'static,
     {
-        let (f, h) = StreamHandle::new(f);
+        let (f, h) = StreamTask::new(f);
         self.submit(f);
         h
     }
@@ -281,9 +280,9 @@ fn test_pool() {
 
         match key {
             Key::Job(i) => {
-                let (_start, _len) = jobs.swap_remove(i).join_now().unwrap();
+                let (_start, _len) = jobs.swap_remove(i).join_now().unwrap().unwrap();
             }
-            Key::Proc(i) => match procs[i].recv_now() {
+            Key::Proc(i) => match procs[i].recv_now().unwrap() {
                 Some((_i, _c)) => {}
                 None => {
                     procs.swap_remove(i);
@@ -336,7 +335,7 @@ fn mini_rust_analyzer() {
     fn main_loop(inbox: &mut devils::Receiver<LspRequest>) {
         let mut pool = ThreadPool::new(4);
 
-        let mut vfs = StreamHandle::spawn(
+        let mut vfs = StreamTask::spawn(
             move |inbox: &mut devils::Receiver<VfsConfig>,
                   outbox: &mut devils::Sender<VfsChange>| {
                 while let Some(VfsConfig) = inbox.next() {
@@ -348,8 +347,8 @@ fn mini_rust_analyzer() {
         );
 
         let mut tasks: Vec<devils::Task<Void, Response>> = Vec::new();
-        let mut active_checker: Option<devils::StreamHandle<Void, CheckMessage>> = None;
-        let mut stopped_checkers: Vec<devils::StreamHandle<Void, CheckMessage>> = Vec::new();
+        let mut active_checker: Option<devils::StreamTask<Void, CheckMessage>> = None;
+        let mut stopped_checkers: Vec<devils::StreamTask<Void, CheckMessage>> = Vec::new();
 
         vfs.send(VfsConfig);
 
@@ -394,16 +393,16 @@ fn mini_rust_analyzer() {
                 },
                 Key::Task(idx) => {
                     let task = tasks.swap_remove(idx);
-                    let resp = task.join_now().expect("task is never cancelled");
+                    let resp = task.join_now().unwrap().expect("task is never cancelled");
                     eprintln!("responding: {}", resp.data);
                 }
                 Key::Vfs => {
-                    let VfsChange = vfs.recv_now().expect("vfs is never cancelled");
+                    let VfsChange = vfs.recv_now().unwrap().expect("vfs is never cancelled");
                     eprintln!("received vfs change");
                     restart_checker = true;
                 }
                 Key::Checker => {
-                    let check_message = active_checker.as_mut().unwrap().recv_now();
+                    let check_message = active_checker.as_mut().unwrap().recv_now().unwrap();
                     match check_message {
                         Some(CheckMessage { message }) => {
                             eprintln!("received check msg: {:?}", message)
@@ -411,7 +410,7 @@ fn mini_rust_analyzer() {
                         None => active_checker = None,
                     }
                 }
-                Key::StoppedChecker(idx) => match stopped_checkers[idx].recv_now() {
+                Key::StoppedChecker(idx) => match stopped_checkers[idx].recv_now().unwrap() {
                     Some(CheckMessage { .. }) => (),
                     None => {
                         stopped_checkers.swap_remove(idx);
@@ -423,7 +422,7 @@ fn mini_rust_analyzer() {
                 if let Some(checker) = active_checker.take() {
                     stopped_checkers.push(checker);
                 }
-                active_checker = Some(StreamHandle::spawn(checker))
+                active_checker = Some(StreamTask::spawn(checker))
             }
         }
     }
@@ -453,7 +452,7 @@ fn mini_rust_analyzer() {
         }
 
         let process: Arc<Process> = Arc::new(Process::default());
-        let mut child = StreamHandle::spawn({
+        let mut child = StreamTask::spawn({
             let process = Arc::clone(&process);
             move |_: &mut devils::Receiver<Void>, outbox: &mut devils::Sender<String>| {
                 while let Some(msg) = process.read() {
@@ -475,7 +474,7 @@ fn mini_rust_analyzer() {
                     }
                 }
             } else {
-                match child.recv_now() {
+                match child.recv_now().unwrap() {
                     Some(message) => outbox.send(CheckMessage { message }),
                     None => break,
                 }

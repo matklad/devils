@@ -145,12 +145,15 @@ use std::{
 
 pub type Void = std::convert::Infallible;
 
+#[derive(Debug)]
+pub struct WouldBlock;
+
 pub struct Task<I, T> {
     sender: Option<Arc<Chan<I, Void>>>,
     receiver: Arc<Chan<Void, thread::Result<T>>>,
 }
 
-pub struct StreamHandle<I, T> {
+pub struct StreamTask<I, T> {
     sender: Option<Arc<Chan<I, Void>>>,
     receiver: Arc<Chan<T, thread::Result<()>>>,
 }
@@ -212,11 +215,11 @@ impl<I, T> Task<I, T> {
         self.stop();
         devoid(self.receiver.recv()).map(propagate)
     }
-    pub fn join_now(mut self) -> Option<T> {
+    pub fn join_now(mut self) -> Result<Option<T>, WouldBlock> {
         self.stop();
         match self.receiver.recv_now().map(devoid) {
-            Ok(it) => it.map(propagate),
-            Err(()) => panic!("join_now not ready"),
+            Ok(it) => Ok(it.map(propagate)),
+            Err(()) => Err(WouldBlock),
         }
     }
     pub fn stop(&mut self) {
@@ -236,8 +239,8 @@ impl<I, T> Drop for Task<I, T> {
     }
 }
 
-impl<I, T> StreamHandle<I, T> {
-    pub fn new<F>(f: F) -> (impl FnOnce() + Send + 'static, StreamHandle<I, T>)
+impl<I, T> StreamTask<I, T> {
+    pub fn new<F>(f: F) -> (impl FnOnce() + Send + 'static, StreamTask<I, T>)
     where
         I: Send + 'static,
         T: Send + 'static,
@@ -265,10 +268,10 @@ impl<I, T> StreamHandle<I, T> {
             }
         };
 
-        (f, StreamHandle { sender: Some(mailbox), receiver: res })
+        (f, StreamTask { sender: Some(mailbox), receiver: res })
     }
 
-    pub fn spawn<F>(f: F) -> StreamHandle<I, T>
+    pub fn spawn<F>(f: F) -> StreamTask<I, T>
     where
         I: Send + 'static,
         T: Send + 'static,
@@ -300,14 +303,14 @@ impl<I, T> StreamHandle<I, T> {
             }
         }
     }
-    pub fn recv_now(&mut self) -> Option<T> {
+    pub fn recv_now(&mut self) -> Result<Option<T>, WouldBlock> {
         match self.receiver.recv_now() {
-            Ok(Ok(it)) => Some(it),
+            Ok(Ok(it)) => Ok(Some(it)),
             Ok(Err(err)) => {
                 err.map(propagate);
-                None
+                Ok(None)
             }
-            Err(()) => panic!("recv_now not ready"),
+            Err(()) => Err(WouldBlock),
         }
     }
     pub fn stop(&mut self) {
@@ -317,7 +320,7 @@ impl<I, T> StreamHandle<I, T> {
     }
 }
 
-impl<I, T> Drop for StreamHandle<I, T> {
+impl<I, T> Drop for StreamTask<I, T> {
     fn drop(&mut self) {
         self.stop();
         loop {
