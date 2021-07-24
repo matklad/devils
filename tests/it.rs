@@ -7,18 +7,18 @@ use std::{
     },
 };
 
-use devils::{Handle, Selector, Void};
+use devils::{Task, Selector, Void};
 
 #[test]
 fn run_to_completion() {
-    let h = Handle::<Void, i32>::start_thread(|_inbox| 92);
+    let h = Task::<Void, i32>::spawn(|_inbox| 92);
     let res = h.join();
     assert_eq!(res, Some(92));
 }
 
 #[test]
 fn drop_before_start() {
-    let (r, h) = Handle::<Void, i32>::spawn(|_inbox| 92);
+    let (r, h) = Task::<Void, i32>::new(|_inbox| 92);
     drop(r);
     let res = h.join();
     assert_eq!(res, None);
@@ -26,7 +26,7 @@ fn drop_before_start() {
 
 #[test]
 fn drop_before_start2() {
-    let (d, h) = Handle::<Void, i32>::spawn(|_inbox| 92);
+    let (d, h) = Task::<Void, i32>::new(|_inbox| 92);
     drop(d);
     drop(h);
 }
@@ -35,13 +35,13 @@ fn drop_before_start2() {
 fn drop_before_start3() {
     #![allow(unused)]
 
-    Handle::<Void, i32>::spawn(|_inbox| 92);
+    Task::<Void, i32>::new(|_inbox| 92);
 }
 
 #[test]
 #[should_panic]
 fn propagates_panic() {
-    Handle::<Void, Void>::start_thread(|_| unwind());
+    Task::<Void, Void>::spawn(|_| unwind());
 }
 
 #[test]
@@ -140,10 +140,10 @@ fn worker_devils() {
     }
 }
 
-type Task = Box<dyn FnOnce() + Send + 'static>;
+type Work = Box<dyn FnOnce() + Send + 'static>;
 
 pub struct ThreadPool {
-    leader: devils::Handle<Task, ()>,
+    leader: devils::Task<Work, ()>,
 }
 
 impl ThreadPool {
@@ -151,13 +151,13 @@ impl ThreadPool {
         let leader = devils::spawn_new_thread(move |inbox| {
             let mut task_queue = VecDeque::new();
             let mut idle: Vec<usize> = (0..n_threads).collect();
-            let mut workers: Vec<devils::StreamHandle<Task, ()>> = (0..n_threads)
+            let mut workers: Vec<devils::StreamHandle<Work, ()>> = (0..n_threads)
                 .map(|_worker| {
                     devils::spawn_stream_new_thread(
-                        move |inbox: &mut devils::Receiver<Task>,
+                        move |inbox: &mut devils::Receiver<Work>,
                               outbox: &mut devils::Sender<()>| {
-                            for task in inbox {
-                                task();
+                            for work in inbox {
+                                work();
                                 outbox.send(())
                             }
                         },
@@ -208,13 +208,13 @@ impl ThreadPool {
     pub fn submit(&mut self, f: impl FnOnce() + Send + 'static) {
         self.leader.send(Box::new(f))
     }
-    pub fn submit_devil<F, I, T>(&mut self, f: F) -> devils::Handle<I, T>
+    pub fn submit_devil<F, I, T>(&mut self, f: F) -> devils::Task<I, T>
     where
         T: Send + 'static,
         I: Send + 'static,
         F: FnOnce(&mut devils::Receiver<I>) -> T + Send + 'static,
     {
-        let (r, h) = Handle::<I, T>::spawn(f);
+        let (r, h) = Task::<I, T>::new(f);
         self.submit(r);
         h
     }
@@ -354,7 +354,7 @@ fn mini_rust_analyzer() {
             },
         );
 
-        let mut tasks: Vec<devils::Handle<Void, Response>> = Vec::new();
+        let mut tasks: Vec<devils::Task<Void, Response>> = Vec::new();
         let mut active_checker: Option<devils::StreamHandle<Void, CheckMessage>> = None;
         let mut stopped_checkers: Vec<devils::StreamHandle<Void, CheckMessage>> = Vec::new();
 

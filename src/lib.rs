@@ -145,7 +145,7 @@ use std::{
 
 pub type Void = std::convert::Infallible;
 
-pub struct Handle<I, T> {
+pub struct Task<I, T> {
     sender: Option<Arc<Chan<I, Void>>>,
     receiver: Arc<Chan<Void, thread::Result<T>>>,
 }
@@ -155,8 +155,8 @@ pub struct StreamHandle<I, T> {
     receiver: Arc<Chan<T, thread::Result<()>>>,
 }
 
-impl<I, T> Handle<I, T> {
-    pub fn spawn<F>(f: F) -> (impl FnOnce() + Send + 'static, Handle<I, T>)
+impl<I, T> Task<I, T> {
+    pub fn new<F>(f: F) -> (impl FnOnce() + Send + 'static, Task<I, T>)
     where
         I: Send + 'static,
         T: Send + 'static,
@@ -182,15 +182,15 @@ impl<I, T> Handle<I, T> {
                 res.close_with(Some(r))
             }
         };
-        (f, Handle { sender: Some(mailbox), receiver: res })
+        (f, Task { sender: Some(mailbox), receiver: res })
     }
-    pub fn start_thread<F>(f: F) -> Handle<I, T>
+    pub fn spawn<F>(f: F) -> Task<I, T>
     where
         I: Send + 'static,
         T: Send + 'static,
         F: FnOnce(&mut Receiver<I>) -> T + Send + 'static,
     {
-        let (r, h) = Self::spawn(f);
+        let (r, h) = Self::new(f);
         std::thread::spawn(r);
         h
     }
@@ -226,7 +226,7 @@ impl<I, T> Handle<I, T> {
     }
 }
 
-impl<I, T> Drop for Handle<I, T> {
+impl<I, T> Drop for Task<I, T> {
     fn drop(&mut self) {
         self.stop();
         let res = devoid(self.receiver.recv());
@@ -346,13 +346,13 @@ impl Devil {
     }
 }
 
-pub fn spawn_new_thread<I, T, F>(f: F) -> Handle<I, T>
+pub fn spawn_new_thread<I, T, F>(f: F) -> Task<I, T>
 where
     I: Send + 'static,
     T: Send + 'static,
     F: FnOnce(&mut Receiver<I>) -> T + Send + 'static,
 {
-    let (r, handle) = Handle::<I, T>::spawn(f);
+    let (r, handle) = Task::<I, T>::new(f);
     let _ = thread::spawn(r);
     handle
 }
