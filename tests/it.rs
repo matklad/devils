@@ -7,26 +7,40 @@ use std::{
     },
 };
 
-use devils::{Selector, StreamTask, Task, Void};
+use devils::{Act, Activity, Mailbox, Selector, Void};
+
+type ATask<T> = Activity<Void, Void, T>;
+type AStream<Y> = Activity<Void, Y, ()>;
 
 #[test]
 fn run_to_completion() {
-    let h = Task::<Void, i32>::spawn(|_inbox| 92);
-    let res = h.join();
-    assert_eq!(res, Some(92));
+    let mut a = ATask::<i32>::spawn(|_inbox| Some(92));
+    let res = a.recv();
+    assert_eq!(res, Act::Complete(92));
+}
+
+#[test]
+fn block_in_drop() {
+    static FLAG: AtomicBool = AtomicBool::new(false);
+    let a = ATask::<()>::spawn(|_| {
+        FLAG.store(true, Relaxed);
+        Some(())
+    });
+    drop(a);
+    assert!(FLAG.load(Relaxed));
 }
 
 #[test]
 fn drop_before_start() {
-    let (r, h) = Task::<Void, i32>::new(|_inbox| 92);
+    let (r, mut a) = ATask::<i32>::new(|_inbox| Some(92));
     drop(r);
-    let res = h.join();
-    assert_eq!(res, None);
+    let res = a.recv();
+    assert_eq!(res, Act::Cancel);
 }
 
 #[test]
 fn drop_before_start2() {
-    let (d, h) = Task::<Void, i32>::new(|_inbox| 92);
+    let (d, h) = ATask::<i32>::new(|_inbox| Some(92));
     drop(d);
     drop(h);
 }
@@ -35,35 +49,40 @@ fn drop_before_start2() {
 fn drop_before_start3() {
     #![allow(unused)]
 
-    Task::<Void, i32>::new(|_inbox| 92);
+    ATask::<i32>::new(|_inbox| Some(92));
 }
 
 #[test]
 #[should_panic]
 fn propagates_panic() {
-    Task::<Void, Void>::spawn(|_| unwind());
+    ATask::<Void>::spawn(|_| unwind());
 }
 
 #[test]
 fn stream_run_to_completion() {
-    let mut h = StreamTask::<Void, i32>::spawn(|_, outbox| (1..=3).for_each(|it| outbox.send(it)));
-    assert_eq!(h.recv(), Some(1));
-    assert_eq!(h.recv(), Some(2));
-    assert_eq!(h.recv(), Some(3));
-    assert_eq!(h.recv(), None);
+    let mut h = AStream::<i32>::spawn(|mailbox| {
+        for it in 1..=3 {
+            mailbox.send(it)
+        }
+        Some(())
+    });
+    assert_eq!(h.recv(), Act::Yield(1));
+    assert_eq!(h.recv(), Act::Yield(2));
+    assert_eq!(h.recv(), Act::Yield(3));
+    assert_eq!(h.recv(), Act::Complete(()));
 }
 
 #[test]
 fn stream_drop_before_start() {
-    let (d, mut h) = StreamTask::<Void, Void>::new(|_, _| ());
+    let (d, mut h) = AStream::<Void>::new(|_| Some(()));
     drop(d);
     let res = h.recv();
-    assert_eq!(res, None);
+    assert_eq!(res, Act::Cancel);
 }
 
 #[test]
 fn stream_drop_before_start2() {
-    let (d, h) = StreamTask::<Void, Void>::new(|_, _| ());
+    let (d, h) = AStream::<Void>::new(|_| Some(()));
     drop(d);
     drop(h);
 }
@@ -71,31 +90,33 @@ fn stream_drop_before_start2() {
 #[test]
 #[should_panic]
 fn stream_propagates_panic() {
-    StreamTask::spawn(|_: &mut devils::Receiver<Void>, _: &mut devils::Sender<Void>| unwind());
+    AStream::<Void>::spawn(|_| unwind());
 }
 
 #[test]
 fn sum() {
-    let mut h = Task::spawn(|inbox| {
+    let mut h = Activity::<u32, Void, u32>::spawn(|mailbox| {
         let mut total: u32 = 0;
-        for msg in inbox {
+        while let Some(msg) = mailbox.recv() {
             total += msg
         }
-        total
+        Some(total)
     });
     for i in 1..=3 {
         h.send(i)
     }
-    let res = h.join();
-    assert_eq!(res, Some(6));
+    h.stop();
+    let res = h.recv();
+    assert_eq!(res, Act::Complete(6));
 }
 
 #[test]
 fn two_devils() {
-    let mut child = StreamTask::spawn(move |child_inbox, outbox| {
-        for msg in child_inbox {
-            outbox.send(msg * 2)
+    let mut child = Activity::<u32, u32, ()>::spawn(move |mailbox| {
+        while let Some(msg) = mailbox.recv() {
+            mailbox.send(msg * 2)
         }
+        Some(())
     });
 
     for i in 1..=3 {
@@ -103,7 +124,7 @@ fn two_devils() {
     }
     child.stop();
     let mut i = 0;
-    while let Some(j) = child.recv() {
+    while let Act::Yield(j) = child.recv() {
         i += 1;
         assert_eq!(j, i * 2);
     }
@@ -116,8 +137,9 @@ fn worker_devils() {
     let mut handles = Vec::new();
     let perm = [7, 3, 1, 5, 4, 8, 6, 2, 10, 9];
     for i in perm {
-        handles.push(Task::spawn(move |_: &mut devils::Receiver<Void>| {
+        handles.push(ATask::<()>::spawn(move |_| {
             while CNT.compare_exchange(i, i + 1, Relaxed, Relaxed).is_err() {}
+            Some(())
         }))
     }
     CNT.store(1, Relaxed);
@@ -127,33 +149,31 @@ fn worker_devils() {
             sel.add(i, h.event());
         }
         let i = sel.wait();
-        let h = handles.swap_remove(i);
-        assert!(h.join_now().unwrap().is_some());
+        let mut h = handles.swap_remove(i);
+        assert_eq!(h.recv_now().unwrap(), Act::Complete(()));
     }
 }
 
 type Work = Box<dyn FnOnce() + Send + 'static>;
 
 pub struct ThreadPool {
-    leader: devils::Task<Work, ()>,
+    leader: Activity<Work, Void, ()>,
 }
 
 impl ThreadPool {
     pub fn new(n_threads: usize) -> ThreadPool {
-        let leader = Task::spawn(move |inbox| {
+        let leader = Activity::spawn(move |mailbox| {
             let mut task_queue = VecDeque::new();
             let mut idle: Vec<usize> = (0..n_threads).collect();
-            let mut workers: Vec<devils::StreamTask<Work, ()>> = (0..n_threads)
+            let mut workers: Vec<_> = (0..n_threads)
                 .map(|_worker| {
-                    StreamTask::spawn(
-                        move |inbox: &mut devils::Receiver<Work>,
-                              outbox: &mut devils::Sender<()>| {
-                            for work in inbox {
-                                work();
-                                outbox.send(())
-                            }
-                        },
-                    )
+                    Activity::<Work, (), ()>::spawn(move |mailbox| {
+                        while let Some(work) = mailbox.recv() {
+                            work();
+                            mailbox.send(())
+                        }
+                        Some(())
+                    })
                 })
                 .collect();
 
@@ -162,7 +182,7 @@ impl ThreadPool {
                 let key = {
                     let mut sel = devils::Selector::new();
                     if inbox_open {
-                        sel.add(workers.len(), inbox.event());
+                        sel.add(workers.len(), mailbox.event());
                     }
                     for (i, w) in workers.iter_mut().enumerate() {
                         sel.add(i, w.event());
@@ -172,14 +192,14 @@ impl ThreadPool {
                 };
 
                 if key == workers.len() {
-                    match inbox.recv_now() {
+                    match mailbox.recv_now().unwrap() {
                         Some(task) => task_queue.push_back(task),
                         None => inbox_open = false,
                     }
                 } else {
                     match workers[key].recv_now().unwrap() {
-                        Some(()) => idle.push(key),
-                        None => panic!("worker thread died"),
+                        Act::Yield(()) => idle.push(key),
+                        _ => panic!("worker thread died"),
                     }
                 }
 
@@ -193,6 +213,7 @@ impl ThreadPool {
                     break;
                 }
             }
+            Some(())
         });
 
         ThreadPool { leader }
@@ -200,23 +221,14 @@ impl ThreadPool {
     pub fn submit(&mut self, f: impl FnOnce() + Send + 'static) {
         self.leader.send(Box::new(f))
     }
-    pub fn submit_devil<F, I, T>(&mut self, f: F) -> devils::Task<I, T>
+    pub fn submit_activity<F, I, Y, C>(&mut self, f: F) -> Activity<I, Y, C>
     where
-        T: Send + 'static,
         I: Send + 'static,
-        F: FnOnce(&mut devils::Receiver<I>) -> T + Send + 'static,
+        Y: Send + 'static,
+        C: Send + 'static,
+        F: FnOnce(&mut Mailbox<I, Y, C>) -> Option<C> + Send + 'static,
     {
-        let (r, h) = Task::<I, T>::new(f);
-        self.submit(r);
-        h
-    }
-    pub fn submit_devil_stream<F, I, T>(&mut self, f: F) -> devils::StreamTask<I, T>
-    where
-        T: Send + 'static,
-        I: Send + 'static,
-        F: FnOnce(&mut devils::Receiver<I>, &mut devils::Sender<T>) + Send + 'static,
-    {
-        let (f, h) = StreamTask::new(f);
+        let (f, h) = Activity::new(f);
         self.submit(f);
         h
     }
@@ -246,17 +258,18 @@ fn test_pool() {
     for i in 0..100 {
         let start = rng.u32(..100);
         if rng.bool() {
-            let h = pool.submit_devil_stream(move |_: &mut devils::Receiver<Void>, outbox| {
+            let h = pool.submit_activity(move |mailbox: &mut Mailbox<Void, (usize, u32), ()>| {
                 for c in collatz(start) {
                     step(i);
-                    outbox.send((i, c));
+                    mailbox.send((i, c));
                 }
+                Some(())
             });
             procs.push(h)
         } else {
-            let h = pool.submit_devil(move |_: &mut devils::Receiver<Void>| {
+            let h = pool.submit_activity(move |_: &mut Mailbox<Void, Void, (u32, usize)>| {
                 let len = collatz(start).inspect(|_| step(i)).count();
-                (start, len)
+                Some((start, len))
             });
             jobs.push(h)
         }
@@ -279,14 +292,17 @@ fn test_pool() {
         };
 
         match key {
-            Key::Job(i) => {
-                let (_start, _len) = jobs.swap_remove(i).join_now().unwrap().unwrap();
-            }
+            Key::Job(i) => match jobs.swap_remove(i).recv_now().unwrap() {
+                Act::Yield(void) => match void {},
+                Act::Complete((_start, _len)) => (),
+                Act::Cancel => panic!(),
+            },
             Key::Proc(i) => match procs[i].recv_now().unwrap() {
-                Some((_i, _c)) => {}
-                None => {
+                Act::Yield((_i, _c)) => {}
+                Act::Complete(()) => {
                     procs.swap_remove(i);
                 }
+                Act::Cancel => panic!(),
             },
         }
     }
@@ -325,30 +341,28 @@ fn mini_rust_analyzer() {
         message: String,
     }
 
-    let mut ra = Task::spawn(main_loop);
+    let mut ra = Activity::spawn(main_loop);
 
     for i in 1..3 {
         ra.send(LspRequest { data: i });
         sleep_ms(100);
     }
 
-    fn main_loop(inbox: &mut devils::Receiver<LspRequest>) {
+    fn main_loop(inbox: &mut Mailbox<LspRequest, Void, ()>) -> Option<()> {
         let mut pool = ThreadPool::new(4);
 
-        let mut vfs = StreamTask::spawn(
-            move |inbox: &mut devils::Receiver<VfsConfig>,
-                  outbox: &mut devils::Sender<VfsChange>| {
-                while let Some(VfsConfig) = inbox.next() {
-                    outbox.send(VfsChange);
-                    outbox.send(VfsChange);
-                    outbox.send(VfsChange);
-                }
-            },
-        );
+        let mut vfs = Activity::<VfsConfig, VfsChange, ()>::spawn(move |mailbox| {
+            while let Some(VfsConfig) = mailbox.recv() {
+                mailbox.send(VfsChange);
+                mailbox.send(VfsChange);
+                mailbox.send(VfsChange);
+            }
+            Some(())
+        });
 
-        let mut tasks: Vec<devils::Task<Void, Response>> = Vec::new();
-        let mut active_checker: Option<devils::StreamTask<Void, CheckMessage>> = None;
-        let mut stopped_checkers: Vec<devils::StreamTask<Void, CheckMessage>> = Vec::new();
+        let mut tasks: Vec<ATask<Response>> = Vec::new();
+        let mut active_checker: Option<AStream<CheckMessage>> = None;
+        let mut stopped_checkers: Vec<AStream<CheckMessage>> = Vec::new();
 
         vfs.send(VfsConfig);
 
@@ -382,37 +396,45 @@ fn mini_rust_analyzer() {
 
             let mut restart_checker = false;
             match key {
-                Key::Inbox => match inbox.recv_now() {
+                Key::Inbox => match inbox.recv_now().unwrap() {
                     Some(request) => {
-                        let task = pool.submit_devil(move |_: &mut devils::Receiver<Void>| {
-                            Response { data: request.data * 2 }
-                        });
+                        let task =
+                            pool.submit_activity(move |_: &mut Mailbox<Void, Void, Response>| {
+                                Some(Response { data: request.data * 2 })
+                            });
                         tasks.push(task);
                     }
                     None => break,
                 },
                 Key::Task(idx) => {
-                    let task = tasks.swap_remove(idx);
-                    let resp = task.join_now().unwrap().expect("task is never cancelled");
+                    let mut task = tasks.swap_remove(idx);
+                    let resp = match task.recv_now().unwrap() {
+                        Act::Yield(void) => match void {},
+                        Act::Complete(it) => it,
+                        Act::Cancel => unreachable!(),
+                    };
                     eprintln!("responding: {}", resp.data);
                 }
                 Key::Vfs => {
-                    let VfsChange = vfs.recv_now().unwrap().expect("vfs is never cancelled");
+                    let VfsChange = match vfs.recv_now().unwrap() {
+                        Act::Yield(it) => it,
+                        _ => panic!("vfs never cancelled"),
+                    };
                     eprintln!("received vfs change");
                     restart_checker = true;
                 }
                 Key::Checker => {
                     let check_message = active_checker.as_mut().unwrap().recv_now().unwrap();
                     match check_message {
-                        Some(CheckMessage { message }) => {
+                        Act::Yield(CheckMessage { message }) => {
                             eprintln!("received check msg: {:?}", message)
                         }
-                        None => active_checker = None,
+                        _ => active_checker = None,
                     }
                 }
                 Key::StoppedChecker(idx) => match stopped_checkers[idx].recv_now().unwrap() {
-                    Some(CheckMessage { .. }) => (),
-                    None => {
+                    Act::Yield(CheckMessage { .. }) => (),
+                    _ => {
                         stopped_checkers.swap_remove(idx);
                     }
                 },
@@ -422,12 +444,13 @@ fn mini_rust_analyzer() {
                 if let Some(checker) = active_checker.take() {
                     stopped_checkers.push(checker);
                 }
-                active_checker = Some(StreamTask::spawn(checker))
+                active_checker = Some(Activity::spawn(checker))
             }
         }
+        Some(())
     }
 
-    fn checker(inbox: &mut devils::Receiver<Void>, outbox: &mut devils::Sender<CheckMessage>) {
+    fn checker(mailbox: &mut Mailbox<Void, CheckMessage, ()>) -> Option<()> {
         #[derive(Default)]
         struct Process {
             killed: AtomicBool,
@@ -452,21 +475,22 @@ fn mini_rust_analyzer() {
         }
 
         let process: Arc<Process> = Arc::new(Process::default());
-        let mut child = StreamTask::spawn({
+        let mut child = AStream::<String>::spawn({
             let process = Arc::clone(&process);
-            move |_: &mut devils::Receiver<Void>, outbox: &mut devils::Sender<String>| {
+            move |mailbox| {
                 while let Some(msg) = process.read() {
-                    outbox.send(msg);
+                    mailbox.send(msg);
                 }
+                Some(())
             }
         });
 
         loop {
             let mut sel = Selector::new();
-            sel.add(true, inbox.event());
+            sel.add(true, mailbox.event());
             sel.add(false, child.event());
             if sel.wait() {
-                match inbox.recv_now() {
+                match mailbox.recv_now().unwrap() {
                     Some(void) => match void {},
                     None => {
                         process.kill();
@@ -475,11 +499,12 @@ fn mini_rust_analyzer() {
                 }
             } else {
                 match child.recv_now().unwrap() {
-                    Some(message) => outbox.send(CheckMessage { message }),
-                    None => break,
+                    Act::Yield(message) => mailbox.send(CheckMessage { message }),
+                    _ => break,
                 }
             }
         }
+        Some(())
     }
 }
 
