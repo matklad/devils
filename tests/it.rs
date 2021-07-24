@@ -7,7 +7,7 @@ use std::{
     },
 };
 
-use devils::{Task, Selector, Void};
+use devils::{Selector, StreamHandle, Task, Void};
 
 #[test]
 fn run_to_completion() {
@@ -46,11 +46,8 @@ fn propagates_panic() {
 
 #[test]
 fn stream_run_to_completion() {
-    let mut h = devils::spawn_stream_new_thread(
-        |_: &mut devils::Receiver<Void>, outbox: &mut devils::Sender<i32>| {
-            (1..=3).for_each(|it| outbox.send(it))
-        },
-    );
+    let mut h =
+        StreamHandle::<Void, i32>::spawn(|_, outbox| (1..=3).for_each(|it| outbox.send(it)));
     assert_eq!(h.recv(), Some(1));
     assert_eq!(h.recv(), Some(2));
     assert_eq!(h.recv(), Some(3));
@@ -59,8 +56,7 @@ fn stream_run_to_completion() {
 
 #[test]
 fn stream_drop_before_start() {
-    let (mut h, d) =
-        devils::spawn_stream(|_: &mut devils::Receiver<Void>, _: &mut devils::Sender<Void>| ());
+    let (d, mut h) = StreamHandle::<Void, Void>::new(|_, _| ());
     drop(d);
     let res = h.recv();
     assert_eq!(res, None);
@@ -68,8 +64,7 @@ fn stream_drop_before_start() {
 
 #[test]
 fn stream_drop_before_start2() {
-    let (h, d) =
-        devils::spawn_stream(|_: &mut devils::Receiver<Void>, _: &mut devils::Sender<Void>| ());
+    let (d, h) = StreamHandle::<Void, Void>::new(|_, _| ());
     drop(d);
     drop(h);
 }
@@ -77,14 +72,12 @@ fn stream_drop_before_start2() {
 #[test]
 #[should_panic]
 fn stream_propagates_panic() {
-    devils::spawn_stream_new_thread(
-        |_: &mut devils::Receiver<Void>, _: &mut devils::Sender<Void>| unwind(),
-    );
+    StreamHandle::spawn(|_: &mut devils::Receiver<Void>, _: &mut devils::Sender<Void>| unwind());
 }
 
 #[test]
 fn sum() {
-    let mut h = devils::spawn_new_thread(|inbox| {
+    let mut h = Task::spawn(|inbox| {
         let mut total: u32 = 0;
         for msg in inbox {
             total += msg
@@ -100,7 +93,7 @@ fn sum() {
 
 #[test]
 fn two_devils() {
-    let mut child = devils::spawn_stream_new_thread(move |child_inbox, outbox| {
+    let mut child = StreamHandle::spawn(move |child_inbox, outbox| {
         for msg in child_inbox {
             outbox.send(msg * 2)
         }
@@ -124,7 +117,7 @@ fn worker_devils() {
     let mut handles = Vec::new();
     let perm = [7, 3, 1, 5, 4, 8, 6, 2, 10, 9];
     for i in perm {
-        handles.push(devils::spawn_new_thread(move |_: &mut devils::Receiver<Void>| {
+        handles.push(Task::spawn(move |_: &mut devils::Receiver<Void>| {
             while CNT.compare_exchange(i, i + 1, Relaxed, Relaxed).is_err() {}
         }))
     }
@@ -148,12 +141,12 @@ pub struct ThreadPool {
 
 impl ThreadPool {
     pub fn new(n_threads: usize) -> ThreadPool {
-        let leader = devils::spawn_new_thread(move |inbox| {
+        let leader = Task::spawn(move |inbox| {
             let mut task_queue = VecDeque::new();
             let mut idle: Vec<usize> = (0..n_threads).collect();
             let mut workers: Vec<devils::StreamHandle<Work, ()>> = (0..n_threads)
                 .map(|_worker| {
-                    devils::spawn_stream_new_thread(
+                    StreamHandle::spawn(
                         move |inbox: &mut devils::Receiver<Work>,
                               outbox: &mut devils::Sender<()>| {
                             for work in inbox {
@@ -224,8 +217,8 @@ impl ThreadPool {
         I: Send + 'static,
         F: FnOnce(&mut devils::Receiver<I>, &mut devils::Sender<T>) + Send + 'static,
     {
-        let (h, d) = devils::spawn_stream(f);
-        self.submit(move || d.run());
+        let (f, h) = StreamHandle::new(f);
+        self.submit(f);
         h
     }
 }
@@ -333,7 +326,7 @@ fn mini_rust_analyzer() {
         message: String,
     }
 
-    let mut ra = devils::spawn_new_thread(main_loop);
+    let mut ra = Task::spawn(main_loop);
 
     for i in 1..3 {
         ra.send(LspRequest { data: i });
@@ -343,7 +336,7 @@ fn mini_rust_analyzer() {
     fn main_loop(inbox: &mut devils::Receiver<LspRequest>) {
         let mut pool = ThreadPool::new(4);
 
-        let mut vfs = devils::spawn_stream_new_thread(
+        let mut vfs = StreamHandle::spawn(
             move |inbox: &mut devils::Receiver<VfsConfig>,
                   outbox: &mut devils::Sender<VfsChange>| {
                 while let Some(VfsConfig) = inbox.next() {
@@ -430,7 +423,7 @@ fn mini_rust_analyzer() {
                 if let Some(checker) = active_checker.take() {
                     stopped_checkers.push(checker);
                 }
-                active_checker = Some(devils::spawn_stream_new_thread(checker))
+                active_checker = Some(StreamHandle::spawn(checker))
             }
         }
     }
@@ -460,7 +453,7 @@ fn mini_rust_analyzer() {
         }
 
         let process: Arc<Process> = Arc::new(Process::default());
-        let mut child = devils::spawn_stream_new_thread({
+        let mut child = StreamHandle::spawn({
             let process = Arc::clone(&process);
             move |_: &mut devils::Receiver<Void>, outbox: &mut devils::Sender<String>| {
                 while let Some(msg) = process.read() {

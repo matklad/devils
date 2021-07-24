@@ -69,9 +69,9 @@
 //! this:
 //!
 //! ```
-//! use devils::{Void, Handle};
+//! use devils::{Void, Task};
 //! # struct Pool; impl Pool { fn submit<T>(&self, _: T) {} } let pool = Pool;
-//! let (devil, handle) = Handle::spawn(|_: &mut devils::Receiver<Void>| 92);
+//! let (devil, handle) = Task::new(|_: &mut devils::Receiver<Void>| 92);
 //! pool.submit(devil);
 //! let res = handle.join();
 //! ```
@@ -102,11 +102,11 @@
 //! One of the `_now` functions is then used to complete the operation. Example:
 //!
 //! ```
-//! use devils::Void;
+//! use devils::{Void, Task};
 //!
-//! devils::spawn_new_thread(|receiver: &mut devils::Receiver<i32>| {
+//! Task::spawn(|receiver: &mut devils::Receiver<i32>| {
 //!     # let spawn_workers = || vec![];
-//!     let mut workers: Vec<devils::Handle<Void, i32>> = spawn_workers();
+//!     let mut workers: Vec<devils::Task<Void, i32>> = spawn_workers();
 //!
 //!     enum Key { Receiver, Worker(usize) }
 //!
@@ -237,6 +237,48 @@ impl<I, T> Drop for Task<I, T> {
 }
 
 impl<I, T> StreamHandle<I, T> {
+    pub fn new<F>(f: F) -> (impl FnOnce() + Send + 'static, StreamHandle<I, T>)
+    where
+        I: Send + 'static,
+        T: Send + 'static,
+        F: FnOnce(&mut Receiver<I>, &mut Sender<T>) + Send + 'static,
+    {
+        let mailbox = Chan::<I, Void>::new();
+        let mailbox = Arc::new(mailbox);
+
+        let res = Chan::<T, thread::Result<()>>::new();
+        let res = Arc::new(res);
+
+        let f = {
+            let mut receiver = Receiver { chan: Arc::clone(&mailbox) };
+            let res = Arc::clone(&res);
+            let defer = defer({
+                let res = Arc::clone(&res);
+                move || res.close_with(None)
+            });
+            move || {
+                let _d = defer;
+                let f = panic::AssertUnwindSafe(f);
+                let mut sender = Sender { chan: Arc::clone(&res) };
+                let r = panic::catch_unwind(move || f.0(&mut receiver, &mut sender));
+                res.close_with(Some(r))
+            }
+        };
+
+        (f, StreamHandle { sender: Some(mailbox), receiver: res })
+    }
+
+    pub fn spawn<F>(f: F) -> StreamHandle<I, T>
+    where
+        I: Send + 'static,
+        T: Send + 'static,
+        F: FnOnce(&mut Receiver<I>, &mut Sender<T>) + Send + 'static,
+    {
+        let (f, h) = Self::new(f);
+        std::thread::spawn(f);
+        h
+    }
+
     pub fn send(&mut self, value: I) {
         match &mut self.sender {
             Some(it) => match it.send(value) {
@@ -334,69 +376,6 @@ impl<I> Iterator for Receiver<I> {
     fn next(&mut self) -> Option<I> {
         self.recv()
     }
-}
-
-pub struct Devil {
-    f: Box<dyn FnOnce() + Send + 'static>,
-}
-
-impl Devil {
-    pub fn run(self) {
-        (self.f)()
-    }
-}
-
-pub fn spawn_new_thread<I, T, F>(f: F) -> Task<I, T>
-where
-    I: Send + 'static,
-    T: Send + 'static,
-    F: FnOnce(&mut Receiver<I>) -> T + Send + 'static,
-{
-    let (r, handle) = Task::<I, T>::new(f);
-    let _ = thread::spawn(r);
-    handle
-}
-
-pub fn spawn_stream<I, T, F>(f: F) -> (StreamHandle<I, T>, Devil)
-where
-    I: Send + 'static,
-    T: Send + 'static,
-    F: FnOnce(&mut Receiver<I>, &mut Sender<T>) + Send + 'static,
-{
-    let mailbox = Chan::<I, Void>::new();
-    let mailbox = Arc::new(mailbox);
-
-    let res = Chan::<T, thread::Result<()>>::new();
-    let res = Arc::new(res);
-
-    let f = Box::new({
-        let mut receiver = Receiver { chan: Arc::clone(&mailbox) };
-        let res = Arc::clone(&res);
-        let defer = defer({
-            let res = Arc::clone(&res);
-            move || res.close_with(None)
-        });
-        move || {
-            let _d = defer;
-            let f = panic::AssertUnwindSafe(f);
-            let mut sender = Sender { chan: Arc::clone(&res) };
-            let r = panic::catch_unwind(move || f.0(&mut receiver, &mut sender));
-            res.close_with(Some(r))
-        }
-    });
-
-    (StreamHandle { sender: Some(mailbox), receiver: res }, Devil { f })
-}
-
-pub fn spawn_stream_new_thread<I, T, F>(f: F) -> StreamHandle<I, T>
-where
-    I: Send + 'static,
-    T: Send + 'static,
-    F: FnOnce(&mut Receiver<I>, &mut Sender<T>) + Send + 'static,
-{
-    let (handle, devil) = spawn_stream(f);
-    let _ = thread::spawn(move || devil.run());
-    handle
 }
 
 pub struct Event<'a> {
